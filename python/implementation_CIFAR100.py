@@ -8,8 +8,7 @@ import tensorflow as tf
 from tensorflow import keras
 import numpy as np
 from time import time
-import keras_applications
-from PIL import Image
+
 
 def quantize(detail, data):
     shape = detail['shape']
@@ -20,26 +19,21 @@ def quantize(detail, data):
 
 
 def build_keras_model():
-    return keras_applications.inception_v3.InceptionV3(
-        weights=None,
-        input_shape=(75, 75, 3),
-        classes=100,
-        backend=keras.backend,
-        layers=keras.layers,
-        models=keras.models,
-        utils=keras.utils)
-
-    # return keras.Sequential([
-    #     keras.layers.Conv2D(filters=32, kernel_size=(3,3), activation='relu', padding='same', input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3)),
-    #     keras.layers.MaxPool2D(pool_size=(2,2)),
-    #     keras.layers.Conv2D(filters=64, kernel_size=(3, 3), activation='relu', padding='same'),
-    #     keras.layers.MaxPool2D(pool_size=(2, 2)),
-    #     keras.layers.Conv2D(filters=64, kernel_size=(3, 3), activation='relu', padding='same'),
-    #     keras.layers.MaxPool2D(pool_size=(2, 2)),
-    #     keras.layers.Flatten(),
-    #     keras.layers.Dense(128, activation='relu'),
-    #     keras.layers.Dense(100, activation='softmax')
-    # ])
+    return keras.Sequential([
+        keras.layers.Conv2D(filters=32, kernel_size=(3,3), activation='relu', padding='same', input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3)),
+        # keras.layers.MaxPool2D(pool_size=(2,2)),
+        # keras.layers.BatchNormalization(),
+        keras.layers.Conv2D(filters=64, kernel_size=(3, 3), activation='relu', padding='same'),
+        keras.layers.MaxPool2D(pool_size=(2, 2)),
+        # keras.layers.BatchNormalization(),
+        keras.layers.Conv2D(filters=128, kernel_size=(3, 3), activation='relu', padding='same'),
+        keras.layers.MaxPool2D(pool_size=(2, 2)),
+        # keras.layers.BatchNormalization(),
+        keras.layers.Flatten(),
+        # keras.layers.Dense(512, activation='relu'),
+        keras.layers.Dense(256, activation='relu'),
+        keras.layers.Dense(10, activation='softmax')
+    ])
 
 
 def representative_dataset_gen():
@@ -47,59 +41,48 @@ def representative_dataset_gen():
         yield [train_images[i: i + 1]]
 
 
-IMG_SIZE = (75, 75)
+IMG_SIZE = (32, 32)
 
-mnist = keras.datasets.cifar100
-(train_images, train_labels), (test_images, test_labels) = mnist.load_data()
+cifar = keras.datasets.cifar10
+(train_images, train_labels), (test_images, test_labels) = cifar.load_data()
 
-train_imgs_resize = []
-test_imgs_resize = []
+train_images = np.reshape(train_images, (train_images.shape[0], IMG_SIZE[0], IMG_SIZE[1], 3))
+test_images = np.reshape(test_images, (test_images.shape[0], IMG_SIZE[0], IMG_SIZE[1], 3))
 
-for img in train_images:
-    res = np.array(Image.fromarray(img).resize(size=IMG_SIZE))
-    train_imgs_resize.append(res)
-train_imgs_resize = np.asarray(train_imgs_resize)
-
-for img in test_images:
-    res = np.array(Image.fromarray(img).resize(size=IMG_SIZE))
-    test_imgs_resize.append(res)
-test_imgs_resize = np.asarray(test_imgs_resize)
-
-# train_images = np.reshape(train_images, (train_images.shape[0], IMG_SIZE[0], IMG_SIZE[1], 3))
-# test_images = np.reshape(test_images, (test_images.shape[0], IMG_SIZE[0], IMG_SIZE[1], 3))
-
-train_imgs_resize = train_imgs_resize.astype('float32') / 255.
-test_imgs_resize = test_imgs_resize.astype('float32') / 255.
+train_images = train_images.astype('float32') / 255.
+test_images = test_images.astype('float32') / 255.
 
 # Creates Quantization Aware Graph for determining quantization parameters
 train_graph = tf.Graph()
 train_sess = tf.Session(graph=train_graph)
 
-keras.backend.set_session(train_sess)
+tf.compat.v1.keras.backend.set_session(train_sess)
 
 with train_graph.as_default():
     train_model = build_keras_model()
     train_model.summary()
 
     tf.contrib.quantize.create_training_graph(input_graph=train_graph, quant_delay=100)
-    train_sess.run(tf.global_variables_initializer())
+    train_sess.run(tf.compat.v1.global_variables_initializer())
 
     train_model.compile(
         optimizer='adam',
         loss='sparse_categorical_crossentropy',
         metrics=['accuracy']
     )
-    train_model.fit(train_imgs_resize, train_labels, epochs=10, batch_size=256)
+    train_model.fit(train_images, train_labels, epochs=2, batch_size=256)
     # save graph and checkpoints
-    saver = tf.train.Saver()
+    saver = tf.compat.v1.train.Saver()
     saver.save(train_sess, 'checkpoints')
 
 float_acc = 0
 float_lat = 0
+print("Working on Float Model...")
 with train_graph.as_default():
     for i in range(10000):
         start = time()
-        pred = train_model.predict(test_imgs_resize[i:i+1])
+        with tf.device('/CPU:0'):
+            pred = train_model.predict(test_images[i:i+1])
         end = time()
         float_lat += end - start
         if np.argmax(pred) == test_labels[i]:
@@ -109,17 +92,17 @@ with train_graph.as_default():
 eval_graph = tf.Graph()
 eval_sess = tf.Session(graph=eval_graph)
 
-keras.backend.set_session(eval_sess)
+tf.compat.v1.keras.backend.set_session(eval_sess)
 
 with eval_graph.as_default():
     keras.backend.set_learning_phase(0)
     eval_model = build_keras_model()
     tf.contrib.quantize.create_eval_graph(input_graph=eval_graph)
     eval_graph_def = eval_graph.as_graph_def()
-    saver = tf.train.Saver()
+    saver = tf.compat.v1.train.Saver()
     saver.restore(eval_sess, 'checkpoints')
 
-    frozen_graph_def = tf.graph_util.convert_variables_to_constants(
+    frozen_graph_def = tf.compat.v1.graph_util.convert_variables_to_constants(
         eval_sess,
         eval_graph_def,
         [eval_model.output.op.name]
@@ -136,7 +119,7 @@ converter = tf.lite.TFLiteConverter.from_frozen_graph(
 )
 
 converter.representative_dataset = representative_dataset_gen
-converter.inference_type = tf.lite.constants.QUANTIZED_UINT8
+converter.inference_type = tf.uint8
 input_arrays = converter.get_input_arrays()
 converter.quantized_input_stats = {input_arrays[0] : (0., 255)}  # mean, std_dev
 converter.default_ranges_stats = (0, 25)
@@ -148,16 +131,18 @@ interpreter.allocate_tensors()
 
 quant_acc = 0
 quant_lat = 0
+print("Working on Quantized Model...")
 for i in range(10000):
     input_detail = interpreter.get_input_details()[0]
     output_detail = interpreter.get_output_details()[0]
 
-    sample_input = quantize(input_detail, test_imgs_resize[i:i+1])
+    sample_input = quantize(input_detail, test_images[i:i+1])
 
     interpreter.set_tensor(input_detail['index'], sample_input)
 
     start = time()
-    interpreter.invoke()
+    with tf.device('/CPU:0'):
+        interpreter.invoke()
     end = time()
     quant_lat += end - start
 
