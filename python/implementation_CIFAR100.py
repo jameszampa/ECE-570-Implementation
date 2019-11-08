@@ -38,7 +38,7 @@ def build_keras_model():
 
 def representative_dataset_gen():
     for i in range(1000):
-        yield [train_images[i: i + 1]]
+        yield [train_images_resize[i: i + 1]]
 
 
 IMG_SIZE = (32, 32)
