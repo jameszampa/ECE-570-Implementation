@@ -7,6 +7,7 @@ https://colab.research.google.com/gist/ohtaman/c1cf119c463fd94b0da50feea320ba1e/
 import tensorflow as tf
 from tensorflow import keras
 import numpy as np
+from time import time
 
 
 def quantize(detail, data):
@@ -17,16 +18,25 @@ def quantize(detail, data):
     return (data / a + b).astype(dtype).reshape(shape)
 
 
-def build_keras_model():
+def build_keras_model_small():
     return keras.Sequential([
-        keras.layers.Conv2D(filters=32, kernel_size=(3,3), activation='relu', padding='same', input_shape=(IMG_SIZE[0], IMG_SIZE[1], 1)),
+        keras.layers.Conv2D(filters=64, kernel_size=(3,3), activation='relu', padding='same', input_shape=(IMG_SIZE[0], IMG_SIZE[1], IMG_SIZE[2])),
         keras.layers.MaxPool2D(pool_size=(2,2)),
+        keras.layers.Flatten(),
+        keras.layers.Dense(32, activation='relu'),
+        keras.layers.Dense(10, activation='softmax')
+    ])
+
+
+def build_keras_model_big():
+    return keras.Sequential([
+        keras.layers.Conv2D(filters=32, kernel_size=(3,3), activation='relu', padding='same', input_shape=(IMG_SIZE[0], IMG_SIZE[1], IMG_SIZE[2])),
         keras.layers.Conv2D(filters=64, kernel_size=(3, 3), activation='relu', padding='same'),
         keras.layers.MaxPool2D(pool_size=(2, 2)),
-        keras.layers.Conv2D(filters=64, kernel_size=(3, 3), activation='relu', padding='same'),
+        keras.layers.Conv2D(filters=128, kernel_size=(3, 3), activation='relu', padding='same'),
         keras.layers.MaxPool2D(pool_size=(2, 2)),
         keras.layers.Flatten(),
-        keras.layers.Dense(128, activation='relu'),
+        keras.layers.Dense(256, activation='relu'),
         keras.layers.Dense(10, activation='softmax')
     ])
 
@@ -36,99 +46,129 @@ def representative_dataset_gen():
         yield [train_images[i: i + 1]]
 
 
-IMG_SIZE = (28, 28)
+def get_dataset(dataset):
+    (train_images, train_labels), (test_images, test_labels) = dataset.load_data()
+    if len(train_images.shape) < 4:
+        img_shape = (train_images.shape[1], train_images.shape[2])
+        train_images = np.reshape(train_images, (train_images.shape[0], img_shape[0], img_shape[1], 1))
+        test_images = np.reshape(test_images, (test_images.shape[0], img_shape[0], img_shape[1], 1))
+    else:
+        img_shape = (train_images.shape[1], train_images.shape[2], train_images.shape[3])
+        train_images = np.reshape(train_images, (train_images.shape[0], img_shape[0], img_shape[1], img_shape[2]))
+        test_images = np.reshape(test_images, (test_images.shape[0], img_shape[0], img_shape[1], img_shape[2]))
+    train_images = train_images.astype('float32') / 255.
+    test_images = test_images.astype('float32') / 255.
+    return train_images, test_images, train_labels, test_labels
 
-mnist = keras.datasets.mnist
-(train_images, train_labels), (test_images, test_labels) = mnist.load_data()
 
-train_images = np.reshape(train_images, (train_images.shape[0], IMG_SIZE[0], IMG_SIZE[1], 1))
-test_images = np.reshape(test_images, (test_images.shape[0], IMG_SIZE[0], IMG_SIZE[1], 1))
+if __name__ == "__main__":
+    train_images, test_images, train_labels, test_labels = get_dataset(keras.datasets.cifar10)
+    if len(train_images.shape) < 4:
+        IMG_SIZE = (train_images.shape[1], train_images.shape[2], 1)
+    else:
+        IMG_SIZE = (train_images.shape[1], train_images.shape[2], train_images.shape[3])
+    # Creates Quantization Aware Graph for determining quantization parameters
+    train_graph = tf.Graph()
+    train_sess = tf.Session(graph=train_graph)
 
-train_images = train_images.astype('float32') / 255.
-test_images = test_images.astype('float32') / 255.
+    tf.compat.v1.keras.backend.set_session(train_sess)
 
-# Creates Quantization Aware Graph for determining quantization parameters
-train_graph = tf.Graph()
-train_sess = tf.Session(graph=train_graph)
+    with train_graph.as_default():
+        train_model = build_keras_model_small()
+        train_model.summary()
 
-keras.backend.set_session(train_sess)
+        tf.contrib.quantize.create_training_graph(input_graph=train_graph, quant_delay=100)
+        train_sess.run(tf.compat.v1.global_variables_initializer())
 
-with train_graph.as_default():
-    train_model = build_keras_model()
-    train_model.summary()
+        train_model.compile(
+            optimizer='adam',
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy']
+        )
+        # Exit training once loss "converges"
+        overfitCallback = keras.callbacks.EarlyStopping(monitor = 'loss', min_delta = 0.01, patience = 2)
+        train_model.fit(train_images, train_labels, epochs=100, batch_size=256, callbacks=[overfitCallback])
+        # save graph and checkpoints
+        saver = tf.compat.v1.train.Saver()
+        saver.save(train_sess, 'checkpoints')
 
-    tf.contrib.quantize.create_training_graph(input_graph=train_graph, quant_delay=100)
-    train_sess.run(tf.global_variables_initializer())
+    float_acc = 0
+    float_lat = 0
+    print("Working on Float Model...")
+    with train_graph.as_default():
+        for i in range(10000):
+            start = time()
+            with tf.device('/CPU:0'): # Restrict to CPU only
+                pred = train_model.predict(test_images[i:i+1])
+            end = time()
+            float_lat += end - start
+            if np.argmax(pred) == test_labels[i]:
+                float_acc += 1
 
-    train_model.compile(
-        optimizer='adam',
-        loss='sparse_categorical_crossentropy',
-        metrics=['accuracy']
+    # eval
+    eval_graph = tf.Graph()
+    eval_sess = tf.Session(graph=eval_graph)
+
+    tf.compat.v1.keras.backend.set_session(eval_sess)
+
+    with eval_graph.as_default():
+        keras.backend.set_learning_phase(0)
+        eval_model = build_keras_model_small()
+        tf.contrib.quantize.create_eval_graph(input_graph=eval_graph)
+        eval_graph_def = eval_graph.as_graph_def()
+        saver = tf.compat.v1.train.Saver()
+        saver.restore(eval_sess, 'checkpoints')
+
+        frozen_graph_def = tf.compat.v1.graph_util.convert_variables_to_constants(
+            eval_sess,
+            eval_graph_def,
+            [eval_model.output.op.name]
+        )
+
+        with open('frozen_model.pb', 'wb') as f:
+            f.write(frozen_graph_def.SerializeToString())
+
+    # convert to tflite from frozen graph
+    converter = tf.lite.TFLiteConverter.from_frozen_graph(
+        graph_def_file='frozen_model.pb',
+        input_arrays=[train_model.layers[0].input.name.split(':')[0]],
+        output_arrays=[train_model.layers[-1].output.name.split(':')[0]]
     )
-    train_model.fit(train_images, train_labels, epochs=10)
-    # save graph and checkpoints
-    saver = tf.train.Saver()
-    saver.save(train_sess, 'checkpoints')
 
-with train_graph.as_default():
-    float_loss, float_acc = train_model.evaluate(test_images, test_labels, batch_size=64)
-    print('Test loss: %.4f accuracy: %.4f' % (float_loss, float_acc))
+    converter.representative_dataset = representative_dataset_gen
+    converter.inference_type = tf.uint8
+    input_arrays = converter.get_input_arrays()
+    converter.quantized_input_stats = {input_arrays[0] : (0., 255)}  # mean, std_dev
+    converter.default_ranges_stats = (0, 25)
+    tflite_model = converter.convert()
+    open('model.tflite', 'wb').write(tflite_model)
 
-# eval
-eval_graph = tf.Graph()
-eval_sess = tf.Session(graph=eval_graph)
+    interpreter = tf.lite.Interpreter(model_path='model.tflite')
+    interpreter.allocate_tensors()
 
-keras.backend.set_session(eval_sess)
+    quant_acc = 0
+    quant_lat = 0
+    print("Working on Quantized Model...")
+    for i in range(10000):
+        input_detail = interpreter.get_input_details()[0]
+        output_detail = interpreter.get_output_details()[0]
 
-with eval_graph.as_default():
-    keras.backend.set_learning_phase(0)
-    eval_model = build_keras_model()
-    tf.contrib.quantize.create_eval_graph(input_graph=eval_graph)
-    eval_graph_def = eval_graph.as_graph_def()
-    saver = tf.train.Saver()
-    saver.restore(eval_sess, 'checkpoints')
+        sample_input = quantize(input_detail, test_images[i:i+1])
 
-    frozen_graph_def = tf.graph_util.convert_variables_to_constants(
-        eval_sess,
-        eval_graph_def,
-        [eval_model.output.op.name]
-    )
+        interpreter.set_tensor(input_detail['index'], sample_input)
 
-    with open('frozen_model.pb', 'wb') as f:
-        f.write(frozen_graph_def.SerializeToString())
+        start = time()
+        with tf.device('/CPU:0'):
+            interpreter.invoke()
+        end = time()
+        quant_lat += end - start
 
-# convert to tflite from frozen graph
-converter = tf.lite.TFLiteConverter.from_frozen_graph(
-    graph_def_file='frozen_model.pb',
-    input_arrays=[train_model.layers[0].input.name.split(':')[0]],
-    output_arrays=[train_model.layers[-1].output.name.split(':')[0]]
-)
+        pred_quantized_model = interpreter.get_tensor(output_detail['index'])
 
-converter.representative_dataset = representative_dataset_gen
-converter.inference_type = tf.lite.constants.QUANTIZED_UINT8
-input_arrays = converter.get_input_arrays()
-converter.quantized_input_stats = {input_arrays[0] : (0., 255)}  # mean, std_dev
-converter.default_ranges_stats = (0, 25)
-tflite_model = converter.convert()
-open('model.tflite', 'wb').write(tflite_model)
+        if np.argmax(pred_quantized_model) == test_labels[i]:
+            quant_acc += 1
 
-interpreter = tf.lite.Interpreter(model_path='model.tflite')
-interpreter.allocate_tensors()
-
-quant_acc = 0
-
-for i in range(10000):
-    input_detail = interpreter.get_input_details()[0]
-    output_detail = interpreter.get_output_details()[0]
-
-    sample_input = quantize(input_detail, test_images[i:i+1])
-
-    interpreter.set_tensor(input_detail['index'], sample_input)
-    interpreter.invoke()
-
-    pred_quantized_model = interpreter.get_tensor(output_detail['index'])
-
-    if np.argmax(pred_quantized_model) == test_labels[i]:
-        quant_acc += 1
-
-print('Quantized Model Accuracy : ', quant_acc / 10000)
+    print('Floating Point Model Accuracy : ', float_acc / 10000)
+    print('Floating Point Model Latency  : ', float_lat / 10000)
+    print('Quantized Model Accuracy      : ', quant_acc / 10000)
+    print('Quantized Model Latency       : ', quant_lat / 10000)
